@@ -1,0 +1,184 @@
+name: MyOpenWrt Builder
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    # ==================== 初始化阶段 ====================
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # 系统级清理
+        sudo rm -rf /etc/apt/sources.list.d/* \
+          /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /opt/hostedtoolcache/CodeQL \
+          /usr/local/lib/python*  # 新增：清理Python缓存
+        sudo docker system prune -a -f  # Docker深度清理
+        sudo -E apt-get -qq update
+        # 精简安装列表（移除非必要依赖）
+        sudo -E apt-get -qq install \
+          build-essential \
+          ccache \
+          gcc-multilib \
+          g++-multilib \
+          git \
+          libncurses5-dev \
+          libssl-dev \
+          python3 \
+          rsync \
+          wget \
+          zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+        df -hT  # 新增：初始化后检查空间
+
+    # ==================== 源码获取阶段 ====================
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        echo "🔄 克隆前磁盘空间：" && df -hT $PWD  # 新增空间检查
+        git clone $REPO_URL -b $REPO_BRANCH openwrt --depth=1  # 浅层克隆
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        echo "✅ 克隆后磁盘空间：" && df -hT $PWD  # 新增空间检查
+
+    # ==================== 自定义配置阶段 ====================
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    # ==================== 编译准备阶段 ====================
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        echo "🔽 开始下载依赖包..."
+        make download -j8
+        # 新增：清理无效下载文件
+        find dl -size -1024c -exec rm -f {} \;  # 删除<1KB的文件
+        find dl -name "*.zip" -exec rm -f {} \;  # 按需删除ZIP文件
+        echo "📦 下载后磁盘空间：" && df -hT $PWD  # 新增空间检查
+
+    # ==================== 编译阶段 ====================
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo "🔨 开始编译（使用 $(nproc) 线程）..."
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        # 新增：编译后清理中间文件
+        rm -rf build_dir/target-*/linux-*/tmp  # 删除内核临时文件
+        rm -rf staging_dir/target-*/linux-*/   # 删除暂存目录
+        echo "💾 编译后磁盘空间：" && df -hT $PWD  # 新增空间检查
+        # 生成输出变量
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    # ==================== 输出处理阶段 ====================
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages  # 清理冗余包目录
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    # ==================== 发布阶段 ====================
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@master
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.MY_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    # ==================== 清理阶段 ====================
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.MY_TOKEN }}
