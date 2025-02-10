@@ -1,151 +1,160 @@
-name: Optimized OpenWrt Builder with Storage Management 
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+#
+# File: .github/workflows/openwrt-bulder.yml
+# Description: Build OpenWrt using GitHub Actions
+#
+# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+
+name: OpenWrt Builder
+
 on:
   repository_dispatch:
   workflow_dispatch:
+
 env:
-  REPO_URL: https://github.com/coolsnowwolf/lede  
-  REPO_BRANCH: master 
-  BUILD_DIR: /builder/openwrt_build 
-  TZ: Asia/Shanghai 
- 
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
 jobs:
   build:
-    runs-on: ubuntu-22.04 
+    runs-on: ubuntu-22.04
+
     steps:
-    # 阶段 1: 基础设施准备 
-    - name: Checkout repository 
-      uses: actions/checkout@v4 
- 
-    - name: Setup build environment 
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment
       env:
-        DEBIAN_FRONTEND: noninteractive 
+        DEBIAN_FRONTEND: noninteractive
       run: |
-        # 清理系统残留 
-        sudo find /tmp -type f -atime +1 -delete 
-        sudo docker system prune -af 
-        
-        # 安装必要工具 
-        sudo -E apt-get -qq update 
-        sudo -E apt-get -qq install xfsprogs lvm2 python3-psutil 
-        sudo -E apt-get -qq autoremove --purge 
-        
-        # 配置时区 
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
- 
-    # 阶段 2: 动态存储扩展 
-    - name: Configure LVM storage 
-      id: storage 
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
       run: |
-        # 清理残留资源 
-        sudo umount -l ${BUILD_DIR} >/dev/null 2>&1 || true 
-        sudo dmsetup remove_all -f >/dev/null 2>&1 || true 
-        sudo vgremove -y build_vg >/dev/null 2>&1 || true 
-        sudo pvremove -y /dev/loop* >/dev/null 2>&1 || true 
-        sudo losetup -D >/dev/null 2>&1 || true 
-     
-        # 动态获取可用loop设备 
-        LOOP_DEVICE=$(sudo losetup -f)
-        echo "Selected loop device: $LOOP_DEVICE"
-     
-        # 计算可用空间（保留10%或5GB中的较大值）
-        root_avail=$(df -BG --output=avail / | tail -1 | tr -d 'G ')
-        reserved_space=$(( (root_avail / 10) > 5 ? (root_avail / 10) : 5 ))
-        alloc_size=$((root_avail - reserved_space))
-        echo "Allocating ${alloc_size}G (Reserved: ${reserved_space}G)"
-     
-        # 创建虚拟磁盘（强制覆盖旧文件）
-        sudo mkdir -p ${BUILD_DIR}
-        sudo rm -f ${BUILD_DIR}/builder.img  
-        sudo truncate -s ${alloc_size}G ${BUILD_DIR}/builder.img  
-        sudo chmod 600 ${BUILD_DIR}/builder.img  
-     
-        # 设置独占模式loop设备 
-        sudo losetup -fP --direct-io ${BUILD_DIR}/builder.img  
-     
-        # 验证设备状态 
-        sudo losetup -l | grep builder.img  
-        sudo blockdev --report $LOOP_DEVICE 
-     
-        # LVM配置（增加重试逻辑）
-        for i in {1..3}; do 
-          sudo pvcreate -y $LOOP_DEVICE && break || sleep 5 
-        done 
-        sudo vgcreate --retry 5 build_vg $LOOP_DEVICE 
-        sudo lvcreate -y -n build_vol -l 100%FREE build_vg 
-     
-        # 文件系统优化 
-        sudo mkfs.xfs  -f -d agcount=32 /dev/build_vg/build_vol  # 分配组优化 
-        sudo mount -o noatime,nodiratime,logbufs=8 /dev/build_vg/build_vol ${BUILD_DIR}
-        sudo chown -R $USER:$USER ${BUILD_DIR}
-     
-        # 验证挂载状态 
-        mount | grep ${BUILD_DIR}
-        df -hT ${BUILD_DIR} | tee storage.log  
- 
-    # 阶段 3: 源码管理 
-    - name: Clone OpenWrt source 
-      working-directory: ${BUILD_DIR}
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
       run: |
-        git clone --depth 1 --shallow-submodules $REPO_URL -b $REPO_BRANCH openwrt 
-        ln -sf ${BUILD_DIR}/openwrt $GITHUB_WORKSPACE/openwrt 
-        du -sh openwrt | tee clone.log  
- 
-    # 阶段 4: 构建配置 
-    - name: Configure build 
-      working-directory: ${BUILD_DIR}/openwrt 
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
       run: |
-        # 并行下载 
-        make download -j$(nproc) || make download -j1 V=s 
-        
-        # 缓存优化 
-        [ -d dl ] && rsync -a $HOME/.openwrt_dl_cache/ dl/ || true 
-        mkdir -p $HOME/.openwrt_dl_cache 
-        
-        # 配置检查 
-        [ -e .config ] && make defconfig 
-        grep '^CONFIG_TARGET' .config | tee config-summary.log  
- 
-    # 阶段 5: 并行编译 
-    - name: Compile firmware 
-      id: compile 
-      working-directory: ${BUILD_DIR}/openwrt 
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package
+      id: package
       run: |
-        # 动态资源分配 
-        cpu_cores=$(nproc)
-        mem_gb=$(free -g | awk '/Mem:/ {print $2}')
-        make_jobs=$(( cpu_cores > mem_gb/2 ? mem_gb/2 : cpu_cores ))
-        
-        echo "Using ${make_jobs} parallel jobs" | tee build.log  
-        ionice -c2 nice -n15 make -j${make_jobs} \
-          || make -j1 \
-          || make -j1 V=s 2>&1 | tee -a build.log  
-        
-        # 提取设备信息 
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | \
-          sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME 
-        echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV 
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV 
- 
-    # 阶段 6: 产物管理 
-    - name: Handle artifacts 
-      if: success() && !cancelled()
-      working-directory: ${BUILD_DIR}/openwrt 
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
       run: |
-        # 清理中间文件 
-        find bin/ -name '*.ipk' -delete 
-        find bin/ -size +500M -exec ls -lh {} \+
-        
-        # 生成SHA256校验 
-        find bin/targets -type f -exec sha256sum {} \; > checksums.txt  
- 
-    # 阶段 7: 存储回收 
-    - name: Cleanup storage 
-      if: always()
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
-        sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches 
-        sudo umount -l ${BUILD_DIR} || true 
-        sudo vgremove -y build_vg || true 
-        sudo pvremove -y /dev/loop0 || true 
-        sudo losetup -D || true 
-        sudo rm -rf ${BUILD_DIR}/builder.img  
-        df -h | tee cleanup.log  
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@master
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.MY_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.MY_TOKEN }}
