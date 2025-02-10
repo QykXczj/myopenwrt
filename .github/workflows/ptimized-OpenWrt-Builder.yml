@@ -36,28 +36,51 @@ jobs:
     - name: Configure LVM storage 
       id: storage 
       run: |
-        # 计算可用空间（保留5GB系统空间）
+        # 清理残留资源 
+        sudo umount -l ${BUILD_DIR} >/dev/null 2>&1 || true 
+        sudo dmsetup remove_all -f >/dev/null 2>&1 || true 
+        sudo vgremove -y build_vg >/dev/null 2>&1 || true 
+        sudo pvremove -y /dev/loop* >/dev/null 2>&1 || true 
+        sudo losetup -D >/dev/null 2>&1 || true 
+     
+        # 动态获取可用loop设备 
+        LOOP_DEVICE=$(sudo losetup -f)
+        echo "Selected loop device: $LOOP_DEVICE"
+     
+        # 计算可用空间（保留10%或5GB中的较大值）
         root_avail=$(df -BG --output=avail / | tail -1 | tr -d 'G ')
-        alloc_size=$((root_avail - 5))
-        
-        # 创建虚拟磁盘 
+        reserved_space=$(( (root_avail / 10) > 5 ? (root_avail / 10) : 5 ))
+        alloc_size=$((root_avail - reserved_space))
+        echo "Allocating ${alloc_size}G (Reserved: ${reserved_space}G)"
+     
+        # 创建虚拟磁盘（强制覆盖旧文件）
         sudo mkdir -p ${BUILD_DIR}
+        sudo rm -f ${BUILD_DIR}/builder.img  
         sudo truncate -s ${alloc_size}G ${BUILD_DIR}/builder.img  
-        sudo losetup /dev/loop0 ${BUILD_DIR}/builder.img  
-        
-        # 配置LVM 
-        sudo pvcreate /dev/loop0 
-        sudo vgcreate build_vg /dev/loop0 
-        sudo lvcreate -n build_vol -l 100%FREE build_vg 
-        
-        # 格式化并挂载 
-        sudo mkfs.xfs  -f /dev/build_vg/build_vol 
-        sudo mount /dev/build_vg/build_vol ${BUILD_DIR}
+        sudo chmod 600 ${BUILD_DIR}/builder.img  
+     
+        # 设置独占模式loop设备 
+        sudo losetup -fP --direct-io ${BUILD_DIR}/builder.img  
+     
+        # 验证设备状态 
+        sudo losetup -l | grep builder.img  
+        sudo blockdev --report $LOOP_DEVICE 
+     
+        # LVM配置（增加重试逻辑）
+        for i in {1..3}; do 
+          sudo pvcreate -y $LOOP_DEVICE && break || sleep 5 
+        done 
+        sudo vgcreate --retry 5 build_vg $LOOP_DEVICE 
+        sudo lvcreate -y -n build_vol -l 100%FREE build_vg 
+     
+        # 文件系统优化 
+        sudo mkfs.xfs  -f -d agcount=32 /dev/build_vg/build_vol  # 分配组优化 
+        sudo mount -o noatime,nodiratime,logbufs=8 /dev/build_vg/build_vol ${BUILD_DIR}
         sudo chown -R $USER:$USER ${BUILD_DIR}
-        
-        # 验证存储 
+     
+        # 验证挂载状态 
+        mount | grep ${BUILD_DIR}
         df -hT ${BUILD_DIR} | tee storage.log  
-        free -h | tee -a storage.log  
  
     # 阶段 3: 源码管理 
     - name: Clone OpenWrt source 
