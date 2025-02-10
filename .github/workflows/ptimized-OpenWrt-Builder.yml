@@ -1,0 +1,128 @@
+name: Optimized OpenWrt Builder with Storage Management 
+on:
+  repository_dispatch:
+  workflow_dispatch:
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede  
+  REPO_BRANCH: master 
+  BUILD_DIR: /builder/openwrt_build 
+  TZ: Asia/Shanghai 
+ 
+jobs:
+  build:
+    runs-on: ubuntu-22.04 
+    steps:
+    # 阶段 1: 基础设施准备 
+    - name: Checkout repository 
+      uses: actions/checkout@v4 
+ 
+    - name: Setup build environment 
+      env:
+        DEBIAN_FRONTEND: noninteractive 
+      run: |
+        # 清理系统残留 
+        sudo find /tmp -type f -atime +1 -delete 
+        sudo docker system prune -af 
+        
+        # 安装必要工具 
+        sudo -E apt-get -qq update 
+        sudo -E apt-get -qq install xfsprogs lvm2 python3-psutil 
+        sudo -E apt-get -qq autoremove --purge 
+        
+        # 配置时区 
+        sudo timedatectl set-timezone "$TZ"
+ 
+    # 阶段 2: 动态存储扩展 
+    - name: Configure LVM storage 
+      id: storage 
+      run: |
+        # 计算可用空间（保留5GB系统空间）
+        root_avail=$(df -BG --output=avail / | tail -1 | tr -d 'G ')
+        alloc_size=$((root_avail - 5))
+        
+        # 创建虚拟磁盘 
+        sudo mkdir -p ${BUILD_DIR}
+        sudo truncate -s ${alloc_size}G ${BUILD_DIR}/builder.img  
+        sudo losetup /dev/loop0 ${BUILD_DIR}/builder.img  
+        
+        # 配置LVM 
+        sudo pvcreate /dev/loop0 
+        sudo vgcreate build_vg /dev/loop0 
+        sudo lvcreate -n build_vol -l 100%FREE build_vg 
+        
+        # 格式化并挂载 
+        sudo mkfs.xfs  -f /dev/build_vg/build_vol 
+        sudo mount /dev/build_vg/build_vol ${BUILD_DIR}
+        sudo chown -R $USER:$USER ${BUILD_DIR}
+        
+        # 验证存储 
+        df -hT ${BUILD_DIR} | tee storage.log  
+        free -h | tee -a storage.log  
+ 
+    # 阶段 3: 源码管理 
+    - name: Clone OpenWrt source 
+      working-directory: ${BUILD_DIR}
+      run: |
+        git clone --depth 1 --shallow-submodules $REPO_URL -b $REPO_BRANCH openwrt 
+        ln -sf ${BUILD_DIR}/openwrt $GITHUB_WORKSPACE/openwrt 
+        du -sh openwrt | tee clone.log  
+ 
+    # 阶段 4: 构建配置 
+    - name: Configure build 
+      working-directory: ${BUILD_DIR}/openwrt 
+      run: |
+        # 并行下载 
+        make download -j$(nproc) || make download -j1 V=s 
+        
+        # 缓存优化 
+        [ -d dl ] && rsync -a $HOME/.openwrt_dl_cache/ dl/ || true 
+        mkdir -p $HOME/.openwrt_dl_cache 
+        
+        # 配置检查 
+        [ -e .config ] && make defconfig 
+        grep '^CONFIG_TARGET' .config | tee config-summary.log  
+ 
+    # 阶段 5: 并行编译 
+    - name: Compile firmware 
+      id: compile 
+      working-directory: ${BUILD_DIR}/openwrt 
+      run: |
+        # 动态资源分配 
+        cpu_cores=$(nproc)
+        mem_gb=$(free -g | awk '/Mem:/ {print $2}')
+        make_jobs=$(( cpu_cores > mem_gb/2 ? mem_gb/2 : cpu_cores ))
+        
+        echo "Using ${make_jobs} parallel jobs" | tee build.log  
+        ionice -c2 nice -n15 make -j${make_jobs} \
+          || make -j1 \
+          || make -j1 V=s 2>&1 | tee -a build.log  
+        
+        # 提取设备信息 
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | \
+          sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME 
+        echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV 
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV 
+ 
+    # 阶段 6: 产物管理 
+    - name: Handle artifacts 
+      if: success() && !cancelled()
+      working-directory: ${BUILD_DIR}/openwrt 
+      run: |
+        # 清理中间文件 
+        find bin/ -name '*.ipk' -delete 
+        find bin/ -size +500M -exec ls -lh {} \+
+        
+        # 生成SHA256校验 
+        find bin/targets -type f -exec sha256sum {} \; > checksums.txt  
+ 
+    # 阶段 7: 存储回收 
+    - name: Cleanup storage 
+      if: always()
+      run: |
+        sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches 
+        sudo umount -l ${BUILD_DIR} || true 
+        sudo vgremove -y build_vg || true 
+        sudo pvremove -y /dev/loop0 || true 
+        sudo losetup -D || true 
+        sudo rm -rf ${BUILD_DIR}/builder.img  
+        df -h | tee cleanup.log  
