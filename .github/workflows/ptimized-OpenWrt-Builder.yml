@@ -1,164 +1,160 @@
-# 由深度求索(DeepSeek)优化的工作流配置 
-# 版本：OpenWrt-Builder-2.1 
-# 适配日期：2025-02-11 
- 
-name: 🛠️ OpenWrt Automated Builder 
- 
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+#
+# File: .github/workflows/openwrt-bulder.yml
+# Description: Build OpenWrt using GitHub Actions
+#
+# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+
+name: OpenWrt Builder
+
 on:
-  workflow_dispatch:    # 手动触发 
-  push:                 # 代码推送触发 
-    branches:
-      - master 
-    paths:
-      - '**/config/**'
-      - '**/diy-*.sh'
- 
+  repository_dispatch:
+  workflow_dispatch:
+
 env:
-  REPO_URL: "https://github.com/coolsnowwolf/lede" 
-  REPO_BRANCH: "master"
-  BUILD_THREADS: "${{ github.run_number  % 8 + 1 }}"  # 动态线程控制 
-  CCACHE_DIR: "/builder/ccache"                      # 缓存复用路径 
-  TZ: "Asia/Shanghai"
- 
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
 jobs:
   build:
-    name: "🏗️ Build OpenWrt (Ubuntu 24.04)"
-    runs-on: ubuntu-24.04 
-    timeout-minutes: 180 
- 
+    runs-on: ubuntu-22.04
+
     steps:
-    # ================= 初始化阶段 ================= 
-    - name: "🔍 Checkout Code"
-      uses: actions/checkout@v4 
-      with:
-        submodules: recursive 
- 
-    - name: "💽 Storage Optimization"
-      run: |
-        # 精确计算可用空间（GB单位）
-        mnt_avail=$(df --output=avail -B1G /mnt | tail -1 | tr -d ' ')
-        mnt_size=$((mnt_avail - 1))  # 保留1GB缓冲 
-        
-        root_avail=$(df --output=avail -B1G / | tail -1 | tr -d ' ')
-        root_size=$((root_avail - 2))  # 保留2GB缓冲 
-        
-        # 创建虚拟磁盘 
-        sudo truncate -s "${mnt_size}G" /mnt/mnt.img  
-        sudo truncate -s "${root_size}G" /root.img  
-        
-        # LVM动态配置 
-        sudo losetup /dev/loop6 /mnt/mnt.img  
-        sudo losetup /dev/loop7 /root.img  
-        sudo pvcreate /dev/loop[6-7]
-        sudo vgcreate builder_vg /dev/loop[6-7]
-        sudo lvcreate -l 100%FREE -n workspace builder_vg 
-        sudo mkfs.xfs  /dev/builder_vg/workspace 
-        sudo mkdir -p /builder 
-        sudo mount /dev/builder_vg/workspace /builder 
-        sudo chown -R runner:runner /builder 
- 
-    # ================= 环境准备阶段 ================= 
-    - name: "⚙️ Setup Environment"
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment
       env:
-        DEBIAN_FRONTEND: noninteractive 
+        DEBIAN_FRONTEND: noninteractive
       run: |
-        # 系统包管理 
-        sudo apt-get -y purge azure* google* microsoft* phy* moby*  # 移除无用组件 
-        sudo apt-get -qq update 
-        sudo apt-get -qq install \
-          build-essential ccache cmake curl libncurses-dev \ 
-          python3-dev rsync unzip zlib1g-dev git-lfs 
-        
-        # 时区配置 
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
-        
-        # 缓存系统配置 
-        sudo mkdir -p $CCACHE_DIR 
-        sudo chown -R runner:runner $CCACHE_DIR 
-        echo "max_size = 10.0G" | sudo tee $CCACHE_DIR/ccache.conf  
- 
-    # ================= 代码构建阶段 ================= 
-    - name: "📥 Clone Repository"
-      working-directory: /builder 
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
       run: |
-        git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt 
-        ln -sf /builder/openwrt $GITHUB_WORKSPACE/openwrt 
- 
-    - name: "🔧 Custom Configuration"
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
       run: |
-        # 应用自定义配置 
-        [ -e feeds.conf.default  ] && cp feeds.conf.default  openwrt/
-        [ -e diy-part1.sh  ] && chmod +x diy-part1.sh  && ./diy-part1.sh  
-        
-        # 初始化编译环境 
-        cd openwrt 
-        ./scripts/feeds update -a 
-        ./scripts/feeds install -a 
-        [ -e ../.config ] && cp ../.config .config 
-        make defconfig 
- 
-    - name: "🚀 Build Firmware"
-      id: compile 
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
       run: |
-        cd openwrt 
-        echo "CCACHE_DIR=$CCACHE_DIR" >> $GITHUB_ENV 
-        
-        # 智能编译控制 
-        if [ $BUILD_THREADS -gt 1 ]; then 
-          make -j$BUILD_THREADS || make -j1 V=s 
-        else 
-          make -j1 V=s 
-        fi 
- 
-        # 构建结果验证 
-        if [ -f bin/targets/*/*/openwrt-* ]; then 
-          echo "status=success" >> $GITHUB_OUTPUT 
-          echo "BUILD_STATUS=✅ Success" >> $GITHUB_ENV 
-        else 
-          echo "status=failure" >> $GITHUB_OUTPUT 
-          echo "BUILD_STATUS=❌ Failed" >> $GITHUB_ENV 
-          exit 1 
-        fi 
- 
-    # ================= 产物处理阶段 ================= 
-    - name: "📦 Package Artifacts"
-      if: steps.compile.outputs.status  == 'success'
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package
+      id: package
       run: |
-        cd openwrt/bin/targets 
-        TARGET_DIR=$(find . -maxdepth 2 -type d -name 'openwrt-*' | head -1)
-        echo "FIRMWARE_PATH=$PWD/$TARGET_DIR" >> $GITHUB_ENV 
-        
-        # 生成版本标识 
-        echo "BUILD_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV 
-        echo "BUILD_DATE=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV 
- 
-    - name: "📤 Upload to Artifacts"
-      uses: actions/upload-artifact@v4 
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
-        name: "firmware-${{ env.BUILD_HASH }}"
-        path: ${{ env.FIRMWARE_PATH }}
- 
-    # ================= 发布阶段 ================= 
-    - name: "🚀 GitHub Release"
-      uses: softprops/action-gh-release@v1 
-      if: success()
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@master
+      if: steps.tag.outputs.status == 'success' && !cancelled()
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.MY_TOKEN }}
       with:
-        tag_name: "build-${{ env.BUILD_DATE }}"
-        name: "Build ${{ env.BUILD_HASH }}"
-        body: |
-          ### 🛠️ Build Information 
-          - Status: ${{ env.BUILD_STATUS }}
-          - Commit: [${{ env.BUILD_HASH }}](https://github.com/${{  github.repository  }}/commit/${{ github.sha  }})
-          - Timestamp: ${{ steps.date.outputs.timestamp  }}
-        files: ${{ env.FIRMWARE_PATH }}/* 
- 
-    # ================= 收尾阶段 ================= 
-    - name: "🧹 Cleanup"
-      if: always()
-      run: |
-        sudo umount /builder 
-        sudo vgremove -f builder_vg 
-        sudo losetup -D 
-        sudo rm -f /mnt/mnt.img  /root.img  
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.MY_TOKEN }}
